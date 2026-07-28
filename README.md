@@ -67,11 +67,23 @@ MCP Client (AI Agent / LLM)
 
 ## Quick Start
 
-### Build
+### Install
 
 ```bash
+cargo install terminal-mcp
+```
+
+The binary `terminal-mcp` will be placed in `~/.cargo/bin/`. Ensure this directory is in your `PATH`.
+
+### Build from Source
+
+```bash
+git clone https://github.com/ZEROLINGG/terminal-mcp
+cd terminal-mcp
 cargo build --release
 ```
+
+Binary at `target/release/terminal-mcp`.
 
 ### Configure MCP Client
 
@@ -81,7 +93,7 @@ Add to your MCP client configuration (e.g., `opencode.json`):
 {
   "mcpServers": {
     "terminal-mcp": {
-      "command": "/path/to/terminal-mcp/target/release/terminal-mcp"
+      "command": "terminal-mcp"
     }
   }
 }
