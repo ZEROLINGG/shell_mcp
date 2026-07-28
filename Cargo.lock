@@ -397,9 +397,9 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "long-shell"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb4353794e18c7680f82d04fe21227130d4f7992eb81f0050348636bddb949ff"
+checksum = "0b1b5422d10aa33e4d76df68d53c3273d9b398dc0d94f4f660a5fda909bb6afa"
 dependencies = [
  "anyhow",
  "codepage",
