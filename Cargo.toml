@@ -1,10 +1,10 @@
 [package]
-name = "shell_mcp"
+name = "terminal-mcp"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Model Context Protocol (MCP) server for long-lived shell execution."
-repository = "https://github.com/ZEROLINGG/shell_mcp"
+repository = "https://github.com/ZEROLINGG/terminal-mcp"
 homepage = "https://github.com/ZEROLINGG"
 
 [dependencies]

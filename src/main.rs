@@ -289,11 +289,11 @@ fn non_shell_hint(shell: &str) -> Option<String> {
 // ============================================================
 
 #[derive(Clone)]
-pub struct ShellMcpService {
+pub struct TerminalMcpService {
     shells: Arc<DashMap<String, Arc<Mutex<Shell>>>>,
 }
 
-impl ShellMcpService {
+impl TerminalMcpService {
     pub fn new() -> Self {
         Self {
             shells: Arc::new(DashMap::new()),
@@ -316,7 +316,7 @@ impl ShellMcpService {
 // ============================================================
 
 #[tool_router]
-impl ShellMcpService {
+impl TerminalMcpService {
     // --------------------------------------------------------
     // Single Execution
     // --------------------------------------------------------
@@ -599,7 +599,7 @@ pub struct ReverseShellArgs {
 // ============================================================
 
 #[prompt_router]
-impl ShellMcpService {
+impl TerminalMcpService {
     #[prompt(name = "shell_usage_guide", description = "Quick reference for core usage principles: when to use exec, when to use interactive sessions")]
     async fn shell_usage_guide(&self) -> Vec<PromptMessage> {
         vec![PromptMessage::new_text(Role::User, guides::QUICK_START)]
@@ -677,7 +677,7 @@ impl ShellMcpService {
 
 #[tool_handler]
 #[prompt_handler]
-impl ServerHandler for ShellMcpService {
+impl ServerHandler for TerminalMcpService {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(
             ServerCapabilities::builder()
@@ -745,7 +745,7 @@ async fn main() -> Result<()> {
 
     tracing::info!(target: "audit", event = "server_start", "shell mcp service starting");
 
-    let server = ShellMcpService::new().serve(stdio()).await?;
+    let server = TerminalMcpService::new().serve(stdio()).await?;
 
     server.waiting().await?;
 
