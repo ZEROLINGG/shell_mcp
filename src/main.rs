@@ -4,7 +4,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use shell_engine::exec::exec;
 use shell_engine::shell::{Key, Shell};
-use shell_engine::util::strip_ansi_codes; // pub fn strip_ansi_codes(text: &str) -> String
+use shell_engine::util::strip_ansi_codes;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters, model::*, prompt, prompt_handler, prompt_router,

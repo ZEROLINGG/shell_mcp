@@ -133,9 +133,9 @@ Each interactive session is identified by a user-defined `tag` (e.g., `"py1"`, `
 
 5. **`shell_send_keys(tag, keys)`** — Send an ordered sequence of literal text and/or special keys (`[Up]`, `[Down]`, `[Left]`, `[Right]`, `[Home]`, `[End]`, `[PageUp]`, `[PageDown]`, `[Insert]`, `[Delete]`, `[Tab]`, `[BackTab]`, `[Enter]`, `[Escape]`, `[Backspace]`, `[F1]`..`[F12]`) as a single burst. Use for shell-history recall, in-line editing, tab-completion, menu navigation, and driving full-screen TUI programs together with `shell_snapshot`. Unknown bracket tags return an explicit error rather than being silently sent as text. See `guide://shell/tui`.
 
-6. **`shell_output(tag, idle_ms?)`** — Read buffered stdout/stderr. Waits until output is silent for `idle_ms` (default 200ms) before returning incremental output. **Must be called after every send_line to confirm state** (or use `shell_wait_for`).
+6. **`shell_output(tag, idle_ms?, strip_ansi?)`** — Read buffered stdout/stderr. Waits until output is silent for `idle_ms` (default 200ms) before returning incremental output. Set `strip_ansi=true` to strip ANSI escape/control sequences (colors, cursor movement, screen-clearing, etc.) from the returned text — mainly intended for pty mode, where the raw byte stream is often interleaved with such sequences and hard to read as plain text. **Must be called after every send_line to confirm state** (or use `shell_wait_for`).
 
-7. **`shell_wait_for(tag, pattern, timeout_ms?)`** — Block until `pattern` appears in stdout/stderr or timeout elapses (default 5000ms). Returns `stdout`, `stderr` and a `matched` boolean. Prefer this over repeated `shell_output` calls for uncertain-duration commands.
+7. **`shell_wait_for(tag, pattern, timeout_ms?, strip_ansi?)`** — Block until `pattern` appears in stdout/stderr or timeout elapses (default 5000ms). Set `strip_ansi=true` to strip ANSI sequences before both the pattern match and the returned text are computed — mainly useful in pty mode, where a plain-text `pattern` might otherwise fail to match because it is interrupted by embedded escape codes. Returns `stdout`, `stderr` and a `matched` boolean. Prefer this over repeated `shell_output` calls for uncertain-duration commands.
 
 8. **`shell_snapshot(tag, idle_ms?)`** — Get a rendered virtual terminal screen snapshot plus the current cursor position (pty sessions only). Returns `{ "screen": "...", "cursor": {"row":.., "col":..} }` (cursor 0-based, null if unavailable). Use instead of `shell_output` in PTY mode to see the actual rendered screen after ANSI escape interpretation.
 
@@ -259,8 +259,8 @@ All subsequent commands execute on the target. Observe output before each next s
 | `shell_send` | Send raw bytes, no newline | `input`, `tag` |
 | `shell_send_control` | Send terminal control character (^C, ^D, ^Z, DEL) | `tag`, `key` |
 | `shell_send_keys` | Send special keys/text burst (arrows, Enter, Escape, F-keys, etc.) | `tag`, `keys` |
-| `shell_output` | Read buffered stdout/stderr | `tag`, `idle_ms?` |
-| `shell_wait_for` | Wait until pattern appears in output (with timeout) | `tag`, `pattern`, `timeout_ms?` |
+| `shell_output` | Read buffered stdout/stderr, with optional ANSI stripping | `tag`, `idle_ms?`, `strip_ansi?` |
+| `shell_wait_for` | Wait until pattern appears in output (with timeout), with optional ANSI stripping | `tag`, `pattern`, `timeout_ms?`, `strip_ansi?` |
 | `shell_snapshot` | Get rendered terminal screen + cursor (PTY only) | `tag`, `idle_ms?` |
 | `shell_cursor_position` | Get current cursor position (PTY only) | `tag` |
 | `shell_move_cursor` | Move cursor to absolute position via ANSI CUP (PTY only) | `tag`, `row`, `col` |
