@@ -1,8 +1,12 @@
-use crate::ToolResponse;
+// src/audit.rs
+
+use serde::Serialize;
+use std::future::Future;
 use tokio::time::Instant;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt};
 
+/// 初始化审计日志：按天滚动、JSON 格式、写入 ./logs 目录。
 pub fn init() -> WorkerGuard {
     let log_dir = "./logs";
     let _ = std::fs::create_dir_all(log_dir);
@@ -36,32 +40,34 @@ pub fn init() -> WorkerGuard {
     guard
 }
 
-pub async fn with_audit<F, Fut>(
-    action: &str,
-    tag: Option<String>,
-    shell: Option<String>,
-    input: Option<String>,
-    f: F,
-) -> String
+/// 通用审计包装器。
+///
+/// `extra` 可以是任意实现了 `Serialize` 的类型（结构体 / `serde_json::json!` 构造的 `Value` 等），
+/// 支持任意数量、任意类型的附加字段，无需修改本函数签名即可扩展。
+///
+/// 字段排序：只要 `serde_json` 没有开启 `preserve_order` feature，
+/// `Value::Object` 底层是 `BTreeMap`，序列化时会自动按 key 字母序排列，
+/// 因此不同调用点写的字段顺序不影响最终日志中的顺序，天然保证一致性。
+pub async fn with_audit<F, Fut, E>(action: &str, extra: E, f: F) -> String
 where
+    E: Serialize,
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<serde_json::Value, String>>,
 {
     let trace_id = uuid::Uuid::new_v4().to_string();
-    let tag_str = tag.unwrap_or_default();
-    let shell_str = shell.unwrap_or_default();
-    let input_str = input.as_deref().unwrap_or_default();
+
+    // 序列化失败时（极少见，比如自定义 Serialize 实现有 bug）退化为 null，
+    // 不影响主流程，只是这次日志的 extra 字段缺失。
+    let extra_json = serde_json::to_value(&extra).unwrap_or(serde_json::Value::Null);
 
     tracing::info!(
-            target: "audit",
-            event = "begin",
-            trace_id = %trace_id,
-            action = action,
-            tag = %tag_str,
-            shell = %shell_str,
-            input = %input_str,
-            "tool call started"
-        );
+        target: "audit",
+        event = "begin",
+        trace_id = %trace_id,
+        action = action,
+        extra = %extra_json,
+        "tool call started"
+    );
 
     let start = Instant::now();
     let result = f().await;
@@ -70,32 +76,28 @@ where
     match &result {
         Ok(_) => {
             tracing::info!(
-                    target: "audit",
-                    event = "end",
-                    trace_id = %trace_id,
-                    action = action,
-                    tag = %tag_str,
-                    shell = %shell_str,
-                    input = %input_str,
-                    success = true,
-                    duration_ms = duration_ms,
-                    "tool call finished"
-                );
+                target: "audit",
+                event = "end",
+                trace_id = %trace_id,
+                action = action,
+                extra = %extra_json,
+                success = true,
+                duration_ms = duration_ms,
+                "tool call finished"
+            );
         }
         Err(e) => {
             tracing::warn!(
-                    target: "audit",
-                    event = "end",
-                    trace_id = %trace_id,
-                    action = action,
-                    tag = %tag_str,
-                    shell = %shell_str,
-                    input = %input_str,
-                    success = false,
-                    duration_ms = duration_ms,
-                    error = %e,
-                    "tool call failed"
-                );
+                target: "audit",
+                event = "end",
+                trace_id = %trace_id,
+                action = action,
+                extra = %extra_json,
+                success = false,
+                duration_ms = duration_ms,
+                error = %e,
+                "tool call failed"
+            );
         }
     }
 
@@ -103,4 +105,25 @@ where
         Ok(data) => crate::ok!(data),
         Err(msg) => crate::err!(msg),
     }
+}
+
+/// 语法糖宏：把若干个已存在的同名变量打包成 `serde_json::Value`，
+/// 等价于 `serde_json::json!({ "name1": name1, "name2": name2, ... })`。
+/// ```ignore
+/// let tag = "t1".to_string();
+/// let shell = "bash".to_string();
+/// let input = "ls -la".to_string();
+///
+/// with_audit(
+///     "run_shell",
+///     audit_extra!(tag, shell, input),
+///     || async move { ... },
+/// )
+/// .await;
+/// ```
+#[macro_export]
+macro_rules! audit_extra {
+    ($($key:ident),* $(,)?) => {
+        serde_json::json!({ $( stringify!($key): $key ),* })
+    };
 }
