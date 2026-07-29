@@ -4,6 +4,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use shell_engine::exec::exec;
 use shell_engine::shell::{Key, Shell};
+use shell_engine::util::strip_ansi_codes; // pub fn strip_ansi_codes(text: &str) -> String
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters, model::*, prompt, prompt_handler, prompt_router,
@@ -113,10 +114,19 @@ This tool runs on the user's actual host machine and has real command execution 
    Use this for shell-history recall, in-line editing, tab-completion, menu navigation, and driving
    full-screen TUI programs together with shell_snapshot. Unknown bracket tags return an explicit
    error instead of being silently sent as text. See guide://shell/tui.
-6. shell_output(tag, idle_ms): Get the output, MUST be called after every send_line; it waits until the output is silent for idle_ms (default 200ms) before returning the incremental stdout/stderr.
-7. shell_wait_for(tag, pattern, timeout_ms): Block until `pattern` appears in stdout/stderr, or until
-   timeout (default 5000ms), then return everything collected so far. Prefer this over repeatedly
-   guessing idle_ms with shell_output when a command's completion time is uncertain (e.g. waiting for
+6. shell_output(tag, idle_ms, strip_ansi): Get the output, MUST be called after every send_line; it
+   waits until the output is silent for idle_ms (default 200ms) before returning the incremental
+   stdout/stderr. Set strip_ansi=true to strip ANSI escape/control sequences (colors, cursor
+   movement, etc.) from the returned text before returning it — this is mainly useful in pty mode,
+   where the raw byte stream is often interleaved with such sequences and hard to read as plain
+   text; when you need the actual rendered screen layout rather than just plain text, prefer
+   shell_snapshot instead (see guide://shell/pty).
+7. shell_wait_for(tag, pattern, timeout_ms, strip_ansi): Block until `pattern` appears in
+   stdout/stderr, or until timeout (default 5000ms), then return everything collected so far.
+   Set strip_ansi=true to strip ANSI sequences before both the pattern match and the returned text
+   are computed — mainly useful in pty mode, where a plain-text `pattern` might otherwise fail to
+   match because it is interrupted by embedded escape codes. Prefer this over repeatedly guessing
+   idle_ms with shell_output when a command's completion time is uncertain (e.g. waiting for
    a breakpoint hit, a login prompt, or a specific log line). The response's `matched` field tells you
    whether the pattern was actually seen (false = timed out without seeing it).
 8. shell_snapshot(tag, idle_ms): Get a rendered terminal screen snapshot plus the current cursor
@@ -124,7 +134,9 @@ This tool runs on the user's actual host machine and has real command execution 
    (cursor 0-based, null if unavailable). In pty mode, ALWAYS prefer this over shell_output to
    understand the program's current on-screen state — including inside full-screen TUI programs —
    since shell_output in pty mode returns raw bytes intermixed with ANSI escape sequences that are
-   hard to interpret directly. See guide://shell/pty and guide://shell/tui.
+   hard to interpret directly (even with strip_ansi=true, stripping only removes the escape codes,
+   it does not reconstruct the actual screen layout the way shell_snapshot does).
+   See guide://shell/pty and guide://shell/tui.
 9. shell_cursor_position(tag): Get just the current cursor (row, col; 0-based) without a full screen
    payload — cheaper than shell_snapshot when you only need to know where the caret/selection
    currently is (pty sessions only).
@@ -185,26 +197,22 @@ scenarios. You should instead call shell_snapshot to get the rendered screen (pl
 position) and judge the program's current state from that before deciding on the next action.
 
 You can still use shell_wait_for / shell_output to detect "whether new output was produced" (e.g.
-waiting for a keyword to appear in the raw stream), but once you need to understand the actual screen
-layout/content, switch to shell_snapshot. Use shell_cursor_position when you only need the caret/
-selection position without the full screen payload.
-
-## Driving full-screen TUI programs
-
-pty mode, combined with shell_snapshot (screen + cursor), shell_send_keys (arrow keys/Enter/Escape/
-Tab/F-keys/etc.), shell_cursor_position, shell_move_cursor, and shell_resize, supports actually
-operating full-screen redraw-based TUI programs (vim/nano/htop/less/whiptail/menuconfig, and
-similar). This is a distinct, more involved workflow than ordinary command execution — read
-guide://shell/tui before attempting it. The short version: it is still strictly turn-based (send one
-input -> snapshot -> decide the next input); never assume several steps ahead of what the screen
-will look like.
+waiting for a keyword to appear in the raw stream). Both accept a `strip_ansi=true` option — mainly
+intended for pty mode — which strips ANSI escape/control sequences from the text before it is
+returned (and, for shell_wait_for, before the pattern match is evaluated). This is useful when you
+only care about plain-text content (e.g. "did the string 'Segmentation fault' appear anywhere"),
+and can prevent a plain-text pattern from failing to match just because it happens to be split up
+by embedded escape codes. It does NOT reconstruct the actual on-screen layout (line wrapping,
+overwritten redraws, cursor-positioned content) — once you need to understand the actual screen
+layout/content, switch to shell_snapshot instead.
 
 ## Typical steps
 
 1. shell_spawn(shell="bash", tag="t1", pty=true)   # default 100x40
 2. shell_send_line(input="some_tty_sensitive_command", tag="t1")
 3. shell_snapshot(tag="t1", idle_ms=500)           # observe the current screen + cursor, instead of shell_output
-4. To wait for a specific keyword: shell_wait_for(tag="t1", pattern="...", timeout_ms=3000)
+4. To wait for a specific keyword: shell_wait_for(tag="t1", pattern="...", timeout_ms=3000,
+   strip_ansi=true)
 5. If driving a full-screen program: shell_send_keys(tag="t1", keys=["[Down]", "[Enter]"]) then
    shell_snapshot again — see guide://shell/tui for the full loop.
 6. shell_close(tag="t1")
@@ -417,6 +425,15 @@ struct OutputParams {
     tag: String,
     /// Idle timeout in milliseconds, default 200
     idle_ms: Option<u64>,
+    /// Whether to strip ANSI escape/control sequences (colors, cursor movement, screen-clearing,
+    /// etc.) from the returned stdout/stderr before returning it, default false. This is mainly
+    /// intended for pty-mode sessions, where the raw byte stream is frequently interleaved with
+    /// such sequences, making it hard to read as plain text. Note this only removes escape codes
+    /// from the raw incremental text — it does NOT reconstruct the actual rendered screen layout
+    /// (line wrapping, overwritten redraws, cursor-positioned content); when you need the real
+    /// on-screen state, use shell_snapshot instead. This field has no effect when used against
+    /// shell_snapshot (its `screen` output is already fully rendered plain text).
+    strip_ansi: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -434,6 +451,13 @@ struct WaitForParams {
     /// Maximum time to wait in milliseconds; returns whatever has been collected so far
     /// even if the pattern was not matched, default 5000
     timeout_ms: Option<u64>,
+    /// Whether to strip ANSI escape/control sequences from stdout/stderr before both returning
+    /// them and evaluating the `pattern` match, default false. This is mainly intended for
+    /// pty-mode sessions: raw pty output is often interleaved with cursor-movement/color escape
+    /// sequences, which can otherwise cause a plain-text `pattern` to fail to match even though
+    /// the text is visually present, or make the returned text hard to read. Has no effect on
+    /// the actual screen layout reconstruction — for that, use shell_snapshot instead.
+    strip_ansi: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -864,10 +888,17 @@ several steps ahead.")]
             .await
     }
 
-    #[tool(description = "Get the output of the specified interactive shell (including stdout and stderr)")]
+    #[tool(description = "Get the output of the specified interactive shell (including stdout and \
+stderr). MUST be called after every shell_send_line to confirm the state before deciding the next \
+step. Set strip_ansi=true to strip ANSI escape/control sequences (colors, cursor movement, \
+screen-clearing, etc.) from the returned stdout/stderr before returning — this is mainly intended \
+for pty-mode sessions, where the raw byte stream is frequently interleaved with such sequences and \
+hard to read as plain text. Note this does not reconstruct the actual rendered screen layout; when \
+you need the real on-screen state (e.g. inside a full-screen TUI program), use shell_snapshot \
+instead (see guide://shell/pty).")]
     async fn shell_output(
         &self,
-        Parameters(OutputParams { tag, idle_ms }): Parameters<OutputParams>,
+        Parameters(OutputParams { tag, idle_ms, strip_ansi }): Parameters<OutputParams>,
     ) -> String {
         let audit_tag = tag.clone();
 
@@ -881,7 +912,16 @@ several steps ahead.")]
             let result = guard.output(idle, None).await;
             drop(guard);
 
-            Ok(serde_json::json!({ "stdout": result.stdout, "stderr": result.stderr }))
+            let (stdout, stderr) = if strip_ansi.unwrap_or(false) {
+                (
+                    strip_ansi_codes(&result.stdout),
+                    strip_ansi_codes(&result.stderr),
+                )
+            } else {
+                (result.stdout, result.stderr)
+            };
+
+            Ok(serde_json::json!({ "stdout": stdout, "stderr": stderr }))
         })
             .await
     }
@@ -891,11 +931,15 @@ or until `timeout_ms` elapses (default 5000), then return everything collected s
 Suitable for commands with uncertain completion time (gdb continue/run hitting a breakpoint, \
 yes/password prompts during ssh login, long-running task completion markers, etc.). Compared to \
 repeatedly calling shell_output(idle_ms=...) and manually guessing the wait time, this significantly \
-reduces the number of interaction turns. The `matched` field in the response indicates whether the \
-pattern was actually seen (false means it timed out without matching).")]
+reduces the number of interaction turns. Set strip_ansi=true to strip ANSI escape/control sequences \
+from stdout/stderr BEFORE both the pattern match and the returned text are computed — mainly \
+intended for pty-mode sessions, where raw output is often interleaved with such sequences, which \
+can otherwise cause a plain-text `pattern` to fail to match even though it is visually present. \
+The `matched` field in the response indicates whether the pattern was actually seen (false means \
+it timed out without matching).")]
     async fn shell_wait_for(
         &self,
-        Parameters(WaitForParams { tag, pattern, timeout_ms }): Parameters<WaitForParams>,
+        Parameters(WaitForParams { tag, pattern, timeout_ms, strip_ansi }): Parameters<WaitForParams>,
     ) -> String {
         let audit_tag = tag.clone();
         let audit_pattern = pattern.clone();
@@ -915,12 +959,20 @@ pattern was actually seen (false means it timed out without matching).")]
                 let result = guard.output_until(pattern.clone(), Some(timeout)).await;
                 drop(guard);
 
-                let matched =
-                    result.stdout.contains(&pattern) || result.stderr.contains(&pattern);
+                let (stdout, stderr) = if strip_ansi.unwrap_or(false) {
+                    (
+                        strip_ansi_codes(&result.stdout),
+                        strip_ansi_codes(&result.stderr),
+                    )
+                } else {
+                    (result.stdout, result.stderr)
+                };
+
+                let matched = stdout.contains(&pattern) || stderr.contains(&pattern);
 
                 Ok(serde_json::json!({
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
+                    "stdout": stdout,
+                    "stderr": stderr,
                     "matched": matched,
                 }))
             },
@@ -936,12 +988,14 @@ of a raw byte stream. In pty mode, ALWAYS prefer this over shell_output to judge
 current state (progress bars, screens after a clear, cursor-positioned redraw-based output, or \
 full-screen TUI programs), because shell_output returns raw incremental bytes that may contain \
 heavy control sequences or already-overwritten intermediate frames and are hard to interpret \
-directly. Full-screen TUI programs (vim/nano/htop/less/whiptail/menuconfig, etc.) are supported \
-via this tool combined with shell_send_keys / shell_cursor_position / shell_move_cursor / \
-shell_resize — see guide://shell/tui for the required send -> snapshot -> decide workflow.")]
+directly (shell_output's strip_ansi option only removes escape codes from the raw text, it does \
+not reconstruct the actual screen layout the way this tool does). Full-screen TUI programs \
+(vim/nano/htop/less/whiptail/menuconfig, etc.) are supported via this tool combined with \
+shell_send_keys / shell_cursor_position / shell_move_cursor / shell_resize — see guide://shell/tui \
+for the required send -> snapshot -> decide workflow.")]
     async fn shell_snapshot(
         &self,
-        Parameters(OutputParams { tag, idle_ms }): Parameters<OutputParams>,
+        Parameters(OutputParams { tag, idle_ms, strip_ansi: _ }): Parameters<OutputParams>,
     ) -> String {
         let audit_tag = tag.clone();
 
