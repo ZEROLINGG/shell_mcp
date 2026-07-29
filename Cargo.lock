@@ -740,9 +740,9 @@ dependencies = [
 
 [[package]]
 name = "shell-engine"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b41de059e2c91e3491136d3a2b4d2cc8fe8c70050558fd122dec5a94cb7b3c2c"
+checksum = "21d32a8b74411757ac854c81527bc0ab0dfc1dfa23c881f01147a6eb7564116e"
 dependencies = [
  "anyhow",
  "codepage",

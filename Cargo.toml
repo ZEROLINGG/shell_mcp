@@ -23,7 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 uuid = { version = "1.24.0", features = ["v4"] }
 
-shell-engine = "0.2.0"
+shell-engine = "0.2.1"
 
 [features]
 default = ["pty"]

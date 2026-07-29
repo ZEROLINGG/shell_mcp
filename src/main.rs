@@ -3,7 +3,7 @@ mod audit;
 use anyhow::Result;
 use dashmap::DashMap;
 use shell_engine::exec::exec;
-use shell_engine::shell::Shell;
+use shell_engine::shell::{Key, Shell};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters, model::*, prompt, prompt_handler, prompt_router,
@@ -41,15 +41,18 @@ After sending each step, you must use `shell_output` to confirm the state before
 If the target program relies on a real terminal (sudo password prompts, colored output/progress bars,
 some remote tools that require a tty), or you need to observe a full-screen redraw-based program,
 consider spawning with `shell_spawn(pty=true)` (default size 100x40) and prefer `shell_snapshot`
-over `shell_output` to observe the current screen. See guide://shell/pty for details.
+over `shell_output` to observe the current screen (snapshot now also reports the cursor position).
+In pty mode you can also actually DRIVE full-screen TUI programs (vim/nano/htop/less/whiptail/
+menuconfig, etc.) using `shell_snapshot` + `shell_send_keys` + `shell_cursor_position` /
+`shell_move_cursor` + `shell_resize` — see guide://shell/pty and guide://shell/tui for details.
 
 For commands with uncertain completion time (gdb continue/run, ssh login prompts, long-running tasks),
 prefer `shell_wait_for(pattern=..., timeout_ms=...)` over repeatedly guessing `idle_ms` with `shell_output`.
 
 ⚠️ Security Guidelines (MUST read guide://shell/security first): All operations of this tool will be audited and recorded; any operation that may adversely affect the user's local machine (destructive commands, privilege escalation, persistent changes, etc.) must be explained to the user to gain explicit consent before execution.
 
-For detailed scenarios, please read_resource: guide://shell/basics, guide://shell/pty, guide://shell/gdb,
-guide://shell/ssh, guide://shell/sudo, guide://shell/reverse_shell,
+For detailed scenarios, please read_resource: guide://shell/basics, guide://shell/pty, guide://shell/tui,
+guide://shell/gdb, guide://shell/ssh, guide://shell/sudo, guide://shell/reverse_shell,
 guide://shell/security
 "#;
 
@@ -59,7 +62,7 @@ guide://shell/security
 This tool runs on the user's actual host machine and has real command execution capabilities; it is NOT a sandbox. Core principle:
 **Any operation that may adversely affect the user's local machine must be explained and explicitly approved by the user before execution.**
 
-1. **Audit Trails**: Every `exec` / `shell_spawn` / `shell_send` / `shell_send_line` / `shell_send_control` call is fully recorded (command content, shell type, tag, time). Do not feel overly restricted by the audit, but never assume an operation can be executed "quietly without anyone knowing."
+1. **Audit Trails**: Every `exec` / `shell_spawn` / `shell_send` / `shell_send_line` / `shell_send_control` / `shell_send_keys` / `shell_move_cursor` / `shell_resize` call is fully recorded (command content, shell type, tag, time). Do not feel overly restricted by the audit, but never assume an operation can be executed "quietly without anyone knowing."
 
 2. **The following types of operations MUST have their intentions explained to the user (what to do, why, and consequences) and require explicit consent before execution**. You cannot assume authorization just because the task description mentions it in passing:
    - **Destructive/Irreversible operations**: `rm -rf`, `dd`, formatting/partitioning disks, dropping databases, overwriting critical files, `git push --force`, deleting large amounts of files/directories.
@@ -68,6 +71,10 @@ This tool runs on the user's actual host machine and has real command execution 
    - **Persistent changes**: Adding scheduled tasks, startup items, system services, new user accounts.
    - **Process/Resource level disruption**: Killing processes not created by this tool, consuming excessive CPU/memory/disk causing local resource exhaustion.
    - Any command whose outcome is uncertain, difficult to undo, or will significantly alter the current state of the local machine.
+   - This also applies when such an action is triggered via full-screen TUI interaction (e.g. saving a
+     config change in a menuconfig-style tool, confirming a destructive action inside a dialog/whiptail
+     wizard) instead of a plain command line — the input method does not change the risk classification
+     of the underlying action.
 
 3. **Low-risk routine operations can be executed directly without asking every time**, such as: read-only queries (ls/cat/grep/ps/df, etc.), creating/editing files in directories explicitly requested by the user, and repetitive operations already approved by the user (e.g., repeatedly reading the output of the same target in a CTF task). Do not constantly interrupt the user for every harmless command for the sake of "absolute security."
 
@@ -75,7 +82,18 @@ This tool runs on the user's actual host machine and has real command execution 
 
 5. **When in doubt, ask by default**: If you cannot determine whether a command will significantly affect the local machine state, err on the side of caution—ask the user first instead of assuming "it should be fine" and executing it.
 
-6. **`shell_send_control` (Ctrl+C/Ctrl+D/etc.) and pty-mode operations only act on subprocess sessions created by this tool itself** (identified by tag), not arbitrary processes on the system. Their risk is comparable to normal command execution within the same session; they do not require the elevated scrutiny of Rule 2 by themselves, but if used to forcibly interrupt a task the user is relying on, you should still inform the user of the consequence.
+6. **`shell_send_control`/`shell_send_keys`/`shell_cursor_position`/`shell_move_cursor`/`shell_resize`
+   (Ctrl+C/Ctrl+D/arrow keys/cursor addressing/window resizing/etc.) and all other pty-mode operations
+   only act on subprocess sessions created by this tool itself** (identified by tag), not arbitrary
+   processes on the system. Their risk is comparable to normal command execution within the same
+   session; they do not require the elevated scrutiny of Rule 2 by themselves. This also applies to
+   driving full-screen TUI programs (vim/htop/less/menuconfig, etc.) via this toolkit — the increased
+   interaction complexity does not by itself increase risk. However: (a) if used to forcibly interrupt
+   a task the user is relying on, you should still inform the user of the consequence; (b) if a TUI
+   interaction ends up performing an action that falls under Rule 2 (e.g. saving a config change that
+   alters the system, or a menuconfig-style tool applying a persistent change), that specific action
+   still requires the same explicit consent as if it were run as an ordinary command — driving it via
+   keystrokes instead of a command line does not exempt it.
 "#;
 
     pub const BASICS: &str = r#"
@@ -83,27 +101,50 @@ This tool runs on the user's actual host machine and has real command execution 
 
 1. shell_spawn(shell, tag, pty=false, cols, rows): Create a session, customize the tag (e.g., "py1").
    Set pty=true to spawn in PTY (pseudo-terminal) mode, default window size 100x40. See guide://shell/pty
-   for when this is needed.
+   for when this is needed, and guide://shell/tui if your goal is to drive a full-screen program
+   (vim/nano/htop/less/whiptail/menuconfig, etc.) inside it.
 2. shell_send_line(input, tag): Send a command and automatically append a newline (Enter); most commonly used. Only returns "sent", without results.
 3. shell_send(input, tag): Send content without appending a newline, used for raw text.
 4. shell_send_control(tag, key): Send a standard terminal control character (C=interrupt, D=EOF, Z=suspend,
    ?=DEL, etc.), clearer and safer than embedding "\x03"/"^C" inside shell_send/shell_send_line.
-5. shell_output(tag, idle_ms): Get the output, MUST be called after every send_line; it waits until the output is silent for idle_ms (default 200ms) before returning the incremental stdout/stderr.
-6. shell_wait_for(tag, pattern, timeout_ms): Block until `pattern` appears in stdout/stderr, or until
+5. shell_send_keys(tag, keys): Send an ordered mix of literal text and bracket-tagged special keys
+   (e.g. "[Up]", "[Down]", "[Left]", "[Right]", "[Home]", "[End]", "[PageUp]", "[PageDown]",
+   "[Insert]", "[Delete]", "[Tab]", "[BackTab]", "[Enter]", "[Escape]", "[Backspace]", "[F1]".."[F12]").
+   Use this for shell-history recall, in-line editing, tab-completion, menu navigation, and driving
+   full-screen TUI programs together with shell_snapshot. Unknown bracket tags return an explicit
+   error instead of being silently sent as text. See guide://shell/tui.
+6. shell_output(tag, idle_ms): Get the output, MUST be called after every send_line; it waits until the output is silent for idle_ms (default 200ms) before returning the incremental stdout/stderr.
+7. shell_wait_for(tag, pattern, timeout_ms): Block until `pattern` appears in stdout/stderr, or until
    timeout (default 5000ms), then return everything collected so far. Prefer this over repeatedly
    guessing idle_ms with shell_output when a command's completion time is uncertain (e.g. waiting for
    a breakpoint hit, a login prompt, or a specific log line). The response's `matched` field tells you
    whether the pattern was actually seen (false = timed out without seeing it).
-7. shell_snapshot(tag, idle_ms): Get a rendered terminal screen snapshot (pty sessions only). In pty
-   mode, prefer this over shell_output to understand the program's current on-screen state, since
-   shell_output in pty mode returns raw bytes intermixed with ANSI escape sequences that are hard to
-   interpret directly. See guide://shell/pty.
-8. shell_reset(tag): Force restart the session when stuck/in an infinite loop.
-9. shell_close(tag): MUST be called when finished to avoid zombie processes.
+8. shell_snapshot(tag, idle_ms): Get a rendered terminal screen snapshot plus the current cursor
+   position (pty sessions only), shaped as `{ "screen": "...", "cursor": {"row":.., "col":..} }`
+   (cursor 0-based, null if unavailable). In pty mode, ALWAYS prefer this over shell_output to
+   understand the program's current on-screen state — including inside full-screen TUI programs —
+   since shell_output in pty mode returns raw bytes intermixed with ANSI escape sequences that are
+   hard to interpret directly. See guide://shell/pty and guide://shell/tui.
+9. shell_cursor_position(tag): Get just the current cursor (row, col; 0-based) without a full screen
+   payload — cheaper than shell_snapshot when you only need to know where the caret/selection
+   currently is (pty sessions only).
+10. shell_move_cursor(tag, row, col): Move the cursor to an absolute 1-based (row, col) position via a
+    standard ANSI CUP sequence (pty sessions only). Only affects where subsequently sent characters
+    land; it does not by itself trigger program behavior.
+11. shell_resize(tag, cols, rows): Dynamically resize an already-running pty session's terminal window
+    without losing session state — use when a column/row-sensitive program needs a different size
+    mid-session (pty sessions only).
+12. shell_reset(tag): Force restart the session when stuck/in an infinite loop.
+13. shell_close(tag): MUST be called when finished to avoid zombie processes.
 
-Limitations: TUI/GUI programs (vim/nano/htop/less) are strictly prohibited in ANY mode (including pty);
-use cat/head/grep to view files. pty mode does not lift this restriction — it only helps with terminal-
-dependent program behavior and screen observation, not real full-screen interactive control.
+Limitations: In pipe mode (pty=false), full-screen TUI/GUI programs (vim/nano/htop/less, etc.) are
+still prohibited — use cat/head/grep to view files, since there is no way to observe the actual
+screen layout without a real terminal. In pty mode (pty=true), full-screen TUI interaction IS
+supported via the toolkit above (shell_snapshot + shell_send_keys + shell_cursor_position +
+shell_move_cursor + shell_resize) — see guide://shell/tui for the required "send -> snapshot ->
+decide" workflow and its caveats. It remains a strict turn-based loop, not true real-time human
+interaction: never send a long chain of keys assuming you already know what several steps ahead
+will look like on screen.
 For long-running commands (gdb continue, ssh connection, large file downloads): prefer shell_wait_for
 with an appropriate pattern; if no specific keyword is known in advance, call shell_output with a larger
 idle_ms (2000~5000ms) and poll again rather than waiting indefinitely in a single call.
@@ -127,41 +168,103 @@ interactive REPLs, ssh, gdb, etc.). Consider explicitly setting pty=true in shel
    output on a real terminal — this is often exactly a missing-tty issue; try re-spawning the same
    command with pty=true.
 3. You need to observe full-screen, redraw-based output (progress bars, cursor-positioned status
-   panels/tables). In pty mode combined with shell_snapshot you can see the "actual current screen";
-   in pipe mode this content would be mixed with large amounts of control sequences and hard to parse.
+   panels/tables), or you need to actually DRIVE a full-screen TUI program (vim/nano/htop/less/
+   whiptail/menuconfig, etc.) — see guide://shell/tui for the dedicated workflow.
 
 Default window size is 100 columns x 40 rows, which is enough for most cases; if the target program is
 sensitive to window size (pagination, table width, line-wrapping based on column count), you can
-customize it via the `cols`/`rows` parameters of shell_spawn.
+customize it via the `cols`/`rows` parameters of shell_spawn, or adjust it later at runtime with
+shell_resize without losing session state.
 
 ## In pty mode, prefer shell_snapshot for reading output
 
 In pty mode, stdout/stderr are merged into a single stream, and the raw byte stream contains many ANSI
 escape sequences (cursor movement, screen clearing, colors, etc.). Continuing to use shell_output in
 this mode gives you the "raw incremental text", which is hard to interpret in full-screen/redraw
-scenarios. You should instead call shell_snapshot to get the rendered screen and judge the program's
-current state from that before deciding on the next action.
+scenarios. You should instead call shell_snapshot to get the rendered screen (plus the current cursor
+position) and judge the program's current state from that before deciding on the next action.
 
 You can still use shell_wait_for / shell_output to detect "whether new output was produced" (e.g.
 waiting for a keyword to appear in the raw stream), but once you need to understand the actual screen
-layout/content, switch to shell_snapshot.
+layout/content, switch to shell_snapshot. Use shell_cursor_position when you only need the caret/
+selection position without the full screen payload.
 
-## Same strict limitations as pipe mode
+## Driving full-screen TUI programs
 
-pty mode does NOT mean full-screen TUI programs (vim/nano/htop/less) can now be treated as something
-you can truly interact with in real time. This tool always works by "send one line -> observe the
-result -> decide the next step"; it cannot perform real-time interaction that requires continuously
-responding to a changing screen. pty mode only exists to (a) satisfy programs that require real
-terminal semantics, and (b) allow better observation of full-screen program state — not to enable
-genuine full-screen interactive control.
+pty mode, combined with shell_snapshot (screen + cursor), shell_send_keys (arrow keys/Enter/Escape/
+Tab/F-keys/etc.), shell_cursor_position, shell_move_cursor, and shell_resize, supports actually
+operating full-screen redraw-based TUI programs (vim/nano/htop/less/whiptail/menuconfig, and
+similar). This is a distinct, more involved workflow than ordinary command execution — read
+guide://shell/tui before attempting it. The short version: it is still strictly turn-based (send one
+input -> snapshot -> decide the next input); never assume several steps ahead of what the screen
+will look like.
 
 ## Typical steps
 
 1. shell_spawn(shell="bash", tag="t1", pty=true)   # default 100x40
 2. shell_send_line(input="some_tty_sensitive_command", tag="t1")
-3. shell_snapshot(tag="t1", idle_ms=500)           # observe the current screen, instead of shell_output
+3. shell_snapshot(tag="t1", idle_ms=500)           # observe the current screen + cursor, instead of shell_output
 4. To wait for a specific keyword: shell_wait_for(tag="t1", pattern="...", timeout_ms=3000)
-5. shell_close(tag="t1")
+5. If driving a full-screen program: shell_send_keys(tag="t1", keys=["[Down]", "[Enter]"]) then
+   shell_snapshot again — see guide://shell/tui for the full loop.
+6. shell_close(tag="t1")
+"#;
+
+    pub const TUI: &str = r#"
+# Driving Full-Screen TUI Programs in PTY mode (vim/nano/htop/less/whiptail/menuconfig, etc.)
+
+With pty=true plus the full pty toolkit (shell_snapshot, shell_cursor_position, shell_send_keys,
+shell_move_cursor, shell_resize), full-screen redraw-based interactive programs are supported.
+This lifts the previous blanket prohibition on vim/nano/htop/less etc. that applies in pipe mode.
+The interaction model is still turn-based (send -> snapshot -> decide), not true real-time
+keystroke-by-keystroke human interaction — you must request a fresh screen snapshot after every
+input before deciding the next key, rather than assuming you already know how the screen looks.
+
+## Core workflow
+
+1. shell_spawn(shell="bash", tag="t1", pty=true[, cols, rows])
+2. shell_send_line(input="vim file.txt", tag="t1")   # or htop / less / whiptail / menuconfig ...
+3. shell_snapshot(tag="t1", idle_ms=300)
+   - ALWAYS use shell_snapshot, never shell_output, once inside a full-screen program.
+   - The response contains both `screen` (rendered plain text, ANSI sequences already interpreted)
+     and `cursor` (0-based row/col), telling you exactly what is on screen and where the caret /
+     selection indicator currently sits.
+4. Decide the next input strictly based on the actual screen content + cursor position, then send:
+   - shell_send_keys(tag="t1", keys=["[Down]", "[Down]", "[Enter]"]) for navigation/menu selection
+   - shell_send(tag="t1", input="ihello world") to e.g. enter vim insert mode and type text
+   - shell_send_keys(tag="t1", keys=["[Escape]"]) to leave insert mode back to vim normal mode
+   - shell_send_line(tag="t1", input=":wq") to run a vim command-line command
+   - shell_send_control(tag="t1", key="C") for interrupt, when a control character is more
+     appropriate than a special key
+5. Re-snapshot after every single action, exactly like the "send one step -> observe -> decide"
+   discipline used everywhere else in this tool. Do NOT send a long chain of keys assuming you
+   know the exact resulting screen several steps ahead — full-screen programs can behave
+   differently depending on terminal size, current mode, or timing, and a wrong assumption
+   compounds quickly across multiple steps.
+6. If cols/rows mismatch causes broken rendering, or the screen becomes hard to interpret, call
+   shell_resize(tag="t1", cols=.., rows=..) and re-snapshot.
+7. When truly stuck (garbled screen, program not responding as expected to the keys you sent),
+   use shell_send_control (e.g. key="C" for interrupt) or shell_reset as escape hatches — do not
+   loop indefinitely guessing keys hoping the screen will recover on its own.
+8. Prefer exiting the program through its own proper quit sequence when possible (e.g. `:wq`/`:q!`
+   in vim, `q` in htop/less, Cancel/Exit in whiptail dialogs) before shell_close, to leave the
+   remote/target state clean — though shell_close will still forcibly terminate the session if
+   the program does not respond.
+
+## Still true / not changed by this capability
+
+- This is not a substitute for a human watching continuous real-time redraws; you only see the
+  screen state at the moments you explicitly call shell_snapshot / shell_cursor_position.
+- Overusing full-screen TUI interaction for tasks that don't need it is wasteful and error-prone —
+  prefer cat/head/grep for simple read-only file inspection, and reserve TUI driving for cases
+  that genuinely require it (editing via vim because no other editor is available, inspecting
+  live status in htop, answering a whiptail/dialog wizard prompt, using menuconfig-style
+  configuration tools, etc.).
+- guide://shell/security still applies in full: if a TUI interaction ends up performing an action
+  that falls under Rule 2 there (e.g. saving a config change that alters the system, applying a
+  persistent/destructive change through a menuconfig-like tool), it still requires the same
+  explicit user consent as if that action were run as an ordinary shell command. Driving a TUI is
+  just a different input method — it does not change what kind of action is being performed.
 "#;
 
     pub const GDB: &str = r#"
@@ -289,8 +392,9 @@ struct SpawnParams {
     tag: String,
     /// Whether to spawn in PTY (pseudo-terminal) mode, default false (pipe mode).
     /// Enable this for programs that rely on real terminal semantics (some sudo prompts,
-    /// colored output/progress bars, tools requiring an allocated tty), or when you need
-    /// to observe full-screen redraw-based output via shell_snapshot.
+    /// colored output/progress bars, tools requiring an allocated tty), when you need
+    /// to observe full-screen redraw-based output via shell_snapshot, or when you intend to
+    /// actually drive a full-screen TUI program (see guide://shell/tui).
     /// See guide://shell/pty for guidance on when to use this.
     pty: Option<bool>,
     /// PTY window column count, only effective when pty=true, default 100
@@ -340,6 +444,40 @@ struct ControlParams {
     /// "Z" = Ctrl+Z (suspend, meaningful in pty mode only), "?" = DEL.
     /// Provide only the letter itself, without a "^" prefix.
     key: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SendKeysParams {
+    /// Target session identifier
+    tag: String,
+    /// Ordered list of items sent as a single burst. Each item is either:
+    /// - literal text, sent as-is (e.g. "ls -la", "ihello world" for entering vim insert mode + typing)
+    /// - a bracket-tagged special key (case-insensitive): [Up] [Down] [Left] [Right] [Home] [End]
+    ///   [PageUp] [PageDown] [Insert] [Delete] [Tab] [BackTab] [Enter] [Escape] [Backspace]
+    ///   [F1]..[F12]
+    /// An unrecognized bracket tag (e.g. a typo like "[Upp]") causes an explicit error instead of
+    /// being silently sent as literal text.
+    keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MoveCursorParams {
+    /// Target session identifier
+    tag: String,
+    /// Target row, 1-based (ANSI CUP convention)
+    row: u16,
+    /// Target column, 1-based (ANSI CUP convention)
+    col: u16,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ResizeParams {
+    /// Target session identifier
+    tag: String,
+    /// New column count (must be >= 1)
+    cols: u16,
+    /// New row count (must be >= 1)
+    rows: u16,
 }
 
 // ============================================================
@@ -531,7 +669,8 @@ impl TerminalMcpService {
 
     #[tool(description = "Create an interactive shell session with the tag as a unique identifier. \
 Set pty=true to spawn in PTY (pseudo-terminal) mode, default window size 100x40; see \
-guide://shell/pty for when this is needed. For complex debugging/remote connection scenarios, \
+guide://shell/pty for when this is needed, and guide://shell/tui if you intend to drive a \
+full-screen TUI program inside it. For complex debugging/remote connection scenarios, \
 it is recommended to first read_resource(guide://shell/gdb or guide://shell/ssh)")]
     async fn shell_spawn(
         &self,
@@ -686,6 +825,45 @@ two special semantics are preserved: R = reset the session (equivalent to shell_
             .await
     }
 
+    #[tool(description = "Send an ordered sequence of literal text and/or special keys \
+(arrow keys, Home/End, PageUp/PageDown, Insert/Delete, Tab/BackTab, Enter/Escape/Backspace, \
+F1-F12) to the specified session as a single burst. Use this instead of embedding raw ANSI \
+escape bytes in shell_send when you need to: recall shell history (Up/Down), move within / edit \
+the current input line (Left/Right/Home/End/Delete/Backspace), trigger tab-completion (Tab), \
+answer arrow-key-driven menus/wizards (whiptail/dialog-style), or drive a full-screen TUI \
+program (vim/htop/less/menuconfig, etc.) together with shell_snapshot — see guide://shell/tui \
+for the required workflow. Unknown bracket-tagged keys (e.g. a typo like \"[Upp]\") return an \
+explicit error instead of being silently sent as literal text. After sending, ALWAYS use \
+shell_snapshot (pty mode) or shell_output (pipe mode) to confirm the result before deciding the \
+next step — never chain many key-sends assuming you already know what the screen will look like \
+several steps ahead.")]
+    async fn shell_send_keys(
+        &self,
+        Parameters(SendKeysParams { tag, keys }): Parameters<SendKeysParams>,
+    ) -> String {
+        let audit_tag = tag.clone();
+        let audit_input = keys.join(" ");
+
+        audit::with_audit(
+            "shell_send_keys",
+            Some(audit_tag),
+            None,
+            Some(audit_input),
+            || async move {
+                let shell = self.get_shell(&tag)?;
+                let seq = keys.into_iter().map(Key::StringChar).collect();
+                shell
+                    .lock()
+                    .await
+                    .send_keys(seq)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!("sent"))
+            },
+        )
+            .await
+    }
+
     #[tool(description = "Get the output of the specified interactive shell (including stdout and stderr)")]
     async fn shell_output(
         &self,
@@ -700,7 +878,7 @@ two special semantics are preserved: R = reset the session (equivalent to shell_
             ));
 
             let mut guard = shell.lock().await;
-            let result = guard.output(idle).await;
+            let result = guard.output(idle, None).await;
             drop(guard);
 
             Ok(serde_json::json!({ "stdout": result.stdout, "stderr": result.stderr }))
@@ -750,14 +928,17 @@ pattern was actually seen (false means it timed out without matching).")]
             .await
     }
 
-    #[tool(description = "Get a rendered virtual terminal screen snapshot of the specified session \
-(only valid for sessions created with pty=true). Returns the current on-screen text after interpreting \
-cursor movement/screen-clearing/color control sequences, instead of a raw byte stream. In pty mode, \
-prefer this over shell_output to judge the program's current state (progress bars, screens after a \
-clear, cursor-positioned redraw-based output), because shell_output returns raw incremental bytes that \
-may contain heavy control sequences or already-overwritten intermediate frames and are hard to interpret \
-directly. Note: this tool is only for 'observing' the current screen; it does not mean real full-screen \
-interactive operation (vim/nano/htop, etc.) is now allowed.")]
+    #[tool(description = "Get a rendered virtual terminal screen snapshot plus the current cursor \
+position of the specified session (only valid for sessions created with pty=true). Returns \
+`{ \"screen\": \"...\", \"cursor\": {\"row\":.., \"col\":..} }` (cursor is 0-based, null if \
+unavailable) after interpreting cursor movement/screen-clearing/color control sequences, instead \
+of a raw byte stream. In pty mode, ALWAYS prefer this over shell_output to judge the program's \
+current state (progress bars, screens after a clear, cursor-positioned redraw-based output, or \
+full-screen TUI programs), because shell_output returns raw incremental bytes that may contain \
+heavy control sequences or already-overwritten intermediate frames and are hard to interpret \
+directly. Full-screen TUI programs (vim/nano/htop/less/whiptail/menuconfig, etc.) are supported \
+via this tool combined with shell_send_keys / shell_cursor_position / shell_move_cursor / \
+shell_resize — see guide://shell/tui for the required send -> snapshot -> decide workflow.")]
     async fn shell_snapshot(
         &self,
         Parameters(OutputParams { tag, idle_ms }): Parameters<OutputParams>,
@@ -774,12 +955,16 @@ interactive operation (vim/nano/htop, etc.) is now allowed.")]
 
                 let mut guard = shell.lock().await;
                 let screen = guard
-                    .output_snapshot(idle)
+                    .output_snapshot(idle, None)
                     .await
                     .map_err(|e| e.to_string())?;
+                let cursor = guard
+                    .cursor_position()
+                    .ok()
+                    .map(|(row, col)| serde_json::json!({ "row": row, "col": col }));
                 drop(guard);
 
-                Ok(serde_json::json!({ "screen": screen }))
+                Ok(serde_json::json!({ "screen": screen, "cursor": cursor }))
             }
             #[cfg(not(feature = "pty"))]
             {
@@ -787,6 +972,110 @@ interactive operation (vim/nano/htop, etc.) is now allowed.")]
                 Err("This build of shell_mcp was not compiled with pty support".to_string())
             }
         })
+            .await
+    }
+
+    #[tool(description = "Get the current cursor position (row, col; 0-based, vt100 convention) on \
+the rendered virtual terminal screen of the specified session (only valid for pty=true sessions). \
+Cheaper than shell_snapshot when you only need to know where the input caret / menu selection \
+indicator currently sits, without pulling the full screen text.")]
+    async fn shell_cursor_position(
+        &self,
+        Parameters(TagParams { tag }): Parameters<TagParams>,
+    ) -> String {
+        let audit_tag = tag.clone();
+
+        audit::with_audit("shell_cursor_position", Some(audit_tag), None, None, || async move {
+            #[cfg(feature = "pty")]
+            {
+                let shell = self.get_shell(&tag)?;
+                let guard = shell.lock().await;
+                let (row, col) = guard.cursor_position().map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({ "row": row, "col": col }))
+            }
+            #[cfg(not(feature = "pty"))]
+            {
+                let _ = tag;
+                Err("This build of shell_mcp was not compiled with pty support".to_string())
+            }
+        })
+            .await
+    }
+
+    #[tool(description = "Move the terminal cursor of the specified session to an absolute (row, col) \
+position via a standard ANSI CUP escape sequence (only valid for pty=true sessions). Coordinates \
+are 1-based (note: this differs from shell_cursor_position/shell_snapshot's 0-based cursor output \
+— add 1 to reuse those values here). Only affects where subsequently sent characters land; it does \
+not by itself trigger program behavior unless the running program itself reads cursor-addressed \
+input (some full-screen TUI programs do). See guide://shell/tui.")]
+    async fn shell_move_cursor(
+        &self,
+        Parameters(MoveCursorParams { tag, row, col }): Parameters<MoveCursorParams>,
+    ) -> String {
+        let audit_tag = tag.clone();
+
+        audit::with_audit(
+            "shell_move_cursor",
+            Some(audit_tag),
+            None,
+            Some(format!("({row},{col})")),
+            || async move {
+                #[cfg(feature = "pty")]
+                {
+                    let shell = self.get_shell(&tag)?;
+                    let mut guard = shell.lock().await;
+                    guard
+                        .move_cursor_to(row, col)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!("moved"))
+                }
+                #[cfg(not(feature = "pty"))]
+                {
+                    let _ = (tag, row, col);
+                    Err("This build of shell_mcp was not compiled with pty support".to_string())
+                }
+            },
+        )
+            .await
+    }
+
+    #[tool(description = "Dynamically resize the PTY window of an already-running session (only valid \
+for pty=true sessions) without losing session state (no need to re-spawn). Use this when a \
+column/row-sensitive program (pagers, progress bars, table renderers, full-screen TUI programs) \
+needs a different terminal size mid-session. cols/rows must be >= 1.")]
+    async fn shell_resize(
+        &self,
+        Parameters(ResizeParams { tag, cols, rows }): Parameters<ResizeParams>,
+    ) -> String {
+        let audit_tag = tag.clone();
+
+        audit::with_audit(
+            "shell_resize",
+            Some(audit_tag),
+            None,
+            Some(format!("{cols}x{rows}")),
+            || async move {
+                if cols == 0 || rows == 0 {
+                    return Err("cols and rows must be >= 1".to_string());
+                }
+                #[cfg(feature = "pty")]
+                {
+                    let shell = self.get_shell(&tag)?;
+                    let mut guard = shell.lock().await;
+                    guard
+                        .resize(cols, rows)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!({ "cols": cols, "rows": rows }))
+                }
+                #[cfg(not(feature = "pty"))]
+                {
+                    let _ = (tag, cols, rows);
+                    Err("This build of shell_mcp was not compiled with pty support".to_string())
+                }
+            },
+        )
             .await
     }
 
@@ -990,6 +1279,7 @@ impl ServerHandler for TerminalMcpService {
                 Resource::new("guide://shell/security", "⚠️ Security Guidelines (Must read first)"),
                 Resource::new("guide://shell/basics", "shell_* Basic Usage and Lifecycle"),
                 Resource::new("guide://shell/pty", "PTY Mode Guide: when to enable pty, and preferring shell_snapshot"),
+                Resource::new("guide://shell/tui", "Driving Full-Screen TUI Programs (vim/htop/less/whiptail) in pty mode"),
                 Resource::new("guide://shell/gdb", "GDB / pwndbg Debugging Scenario Guide"),
                 Resource::new("guide://shell/ssh", "SSH Remote Connection Scenario Guide"),
                 Resource::new("guide://shell/sudo", "sudo Password / Confirmation Scenario Guide"),
@@ -1009,6 +1299,7 @@ impl ServerHandler for TerminalMcpService {
             "guide://shell/security" => guides::SECURITY,
             "guide://shell/basics" => guides::BASICS,
             "guide://shell/pty" => guides::PTY,
+            "guide://shell/tui" => guides::TUI,
             "guide://shell/gdb" => guides::GDB,
             "guide://shell/ssh" => guides::SSH,
             "guide://shell/sudo" => guides::SUDO,
