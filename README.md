@@ -22,11 +22,11 @@ After every `shell_send_line`, you **must** call `shell_output` (or `shell_wait_
 ## Features
 
 - **One-shot execution** — `exec` with configurable shell interpreter (bash/sh/zsh/python/node...), timeout, and non-blocking output capture
-- **Stateful interactive sessions** — Full lifecycle management across 12 tools: spawn, send, send-line, send-control, output, wait-for, snapshot, list, exists, reset, close, close-all
+- **Stateful interactive sessions** — Full lifecycle management across 16 tools: spawn, send, send-line, send-control, send-keys, output, wait-for, snapshot, cursor-position, move-cursor, resize, list, exists, reset, close, close-all
 - **Long-running process support** — `shell_wait_for` with pattern matching and timeout for uncertain-duration commands (gdb continue, SSH handshake, large downloads); poll-based observation as fallback
 - **Built-in prompt templates** — Guided step-by-step workflows for GDB/pwndbg debugging, SSH connections, sudo password handling, and CTF reverse shell listener setup
 - **Resource documentation** — Inline guides via `guide://shell/*` URIs (security policy, lifecycle basics, per-scenario recipes)
-- **PTY (Pseudo-Terminal) mode** — Spawn sessions with `pty=true` for programs that require a real terminal (sudo, colored output, tty-sensitive tools); observe rendered screen via `shell_snapshot`
+- **PTY (Pseudo-Terminal) mode** — Spawn sessions with `pty=true` for programs that require a real terminal (sudo, colored output, tty-sensitive tools); observe rendered screen via `shell_snapshot` or drive full-screen TUI programs (vim/nano/htop/less/whiptail/menuconfig) via `shell_send_keys` + cursor control tools
 - **Shell blacklist** — Blocks direct invocation of interactive programs (gdb, ssh, mysql, psql, etc.) as interpreters; enforces the correct spawn-bash-then-send pattern
 - **Audit logging** — Every command invocation recorded as structured JSON (trace ID, timing, shell/tag/input, success/failure) to daily rolling logs
 
@@ -45,9 +45,13 @@ MCP Client (AI Agent / LLM)
 │  │ @tool  » shell_send            │  │
 │  │ @tool  » shell_send_line       │  │
 │  │ @tool  » shell_send_control    │  │
+│  │ @tool  » shell_send_keys       │  │
 │  │ @tool  » shell_output          │  │
 │  │ @tool  » shell_wait_for        │  │
 │  │ @tool  » shell_snapshot        │  │
+│  │ @tool  » shell_cursor_position │  │
+│  │ @tool  » shell_move_cursor     │  │
+│  │ @tool  » shell_resize          │  │
 │  │ @tool  » shell_list            │  │
 │  │ @tool  » shell_exists          │  │
 │  │ @tool  » shell_reset           │  │
@@ -111,7 +115,7 @@ Add to your MCP client configuration (e.g., `opencode.json`):
 
 ## Interactive Session Lifecycle
 
-The `shell_*` family (12 tools) provides fine-grained control over long-lived processes. Understanding the lifecycle is critical for reliable multi-step automation.
+The `shell_*` family (16 tools) provides fine-grained control over long-lived processes. Understanding the lifecycle is critical for reliable multi-step automation.
 
 ### Tag-based Sessions
 
@@ -127,21 +131,29 @@ Each interactive session is identified by a user-defined `tag` (e.g., `"py1"`, `
 
 4. **`shell_send_control(tag, key)`** — Send a standard terminal control character. `"C"` = Ctrl+C (interrupt), `"D"` = Ctrl+D (EOF), `"Z"` = Ctrl+Z (suspend), `"?"` = DEL. Clearer and safer than embedding raw bytes.
 
-5. **`shell_output(tag, idle_ms?)`** — Read buffered stdout/stderr. Waits until output is silent for `idle_ms` (default 200ms) before returning incremental output. **Must be called after every send_line to confirm state** (or use `shell_wait_for`).
+5. **`shell_send_keys(tag, keys)`** — Send an ordered sequence of literal text and/or special keys (`[Up]`, `[Down]`, `[Left]`, `[Right]`, `[Home]`, `[End]`, `[PageUp]`, `[PageDown]`, `[Insert]`, `[Delete]`, `[Tab]`, `[BackTab]`, `[Enter]`, `[Escape]`, `[Backspace]`, `[F1]`..`[F12]`) as a single burst. Use for shell-history recall, in-line editing, tab-completion, menu navigation, and driving full-screen TUI programs together with `shell_snapshot`. Unknown bracket tags return an explicit error rather than being silently sent as text. See `guide://shell/tui`.
 
-6. **`shell_wait_for(tag, pattern, timeout_ms?)`** — Block until `pattern` appears in stdout/stderr or timeout elapses (default 5000ms). Returns `stdout`, `stderr` and a `matched` boolean. Prefer this over repeated `shell_output` calls for uncertain-duration commands.
+6. **`shell_output(tag, idle_ms?)`** — Read buffered stdout/stderr. Waits until output is silent for `idle_ms` (default 200ms) before returning incremental output. **Must be called after every send_line to confirm state** (or use `shell_wait_for`).
 
-7. **`shell_snapshot(tag, idle_ms?)`** — Get a rendered terminal screen snapshot (pty sessions only). Use instead of `shell_output` in PTY mode to see the actual screen after ANSI rendering.
+7. **`shell_wait_for(tag, pattern, timeout_ms?)`** — Block until `pattern` appears in stdout/stderr or timeout elapses (default 5000ms). Returns `stdout`, `stderr` and a `matched` boolean. Prefer this over repeated `shell_output` calls for uncertain-duration commands.
 
-8. **`shell_reset(tag)`** — Force-restart a session when stuck in an infinite loop or hung state.
+8. **`shell_snapshot(tag, idle_ms?)`** — Get a rendered virtual terminal screen snapshot plus the current cursor position (pty sessions only). Returns `{ "screen": "...", "cursor": {"row":.., "col":..} }` (cursor 0-based, null if unavailable). Use instead of `shell_output` in PTY mode to see the actual rendered screen after ANSI escape interpretation.
 
-9. **`shell_close(tag)`** — Terminate and remove a session. **Always close sessions when done** to prevent zombie processes.
+9. **`shell_cursor_position(tag)`** — Get just the current cursor (row, col; 0-based) without a full screen payload (pty sessions only). Cheaper than `shell_snapshot` when you only need the caret/selection position.
 
-10. **`shell_close_all`** — Cleanup all active sessions at once.
+10. **`shell_move_cursor(tag, row, col)`** — Move the cursor to an absolute 1-based (row, col) position via a standard ANSI CUP sequence (pty sessions only). Only affects where subsequently sent characters land; does not by itself trigger program behavior.
 
-11. **`shell_list`** — List all active tags with shell paths, PTY status, and truncation info.
+11. **`shell_resize(tag, cols, rows)`** — Dynamically resize an already-running pty session's terminal window without losing session state (pty sessions only). Use when a column/row-sensitive program needs a different size mid-session.
 
-12. **`shell_exists(tag)`** — Check if a given tag is currently active.
+12. **`shell_reset(tag)`** — Force-restart a session when stuck in an infinite loop or hung state.
+
+13. **`shell_close(tag)`** — Terminate and remove a session. **Always close sessions when done** to prevent zombie processes.
+
+14. **`shell_close_all`** — Cleanup all active sessions at once.
+
+15. **`shell_list`** — List all active tags with shell paths, PTY status, truncation info, and busy state.
+
+16. **`shell_exists(tag)`** — Check if a given tag is currently active.
 
 ### Output Polling for Long-Running Commands
 
@@ -153,9 +165,9 @@ For operations with uncertain execution time (gdb `continue`, SSH handshake, lar
 
 ### Limitations
 
-- **No TUI/GUI programs**: vim, nano, htop, less, and similar full-screen programs are unsupported in any mode (including PTY). Use alternatives like cat, head, grep, or ps to inspect state.
-- **PTY mode available**: Set `pty=true` in `shell_spawn` for programs that require a real terminal (some `sudo` prompts, colored output, tty-detection tools). In PTY mode, prefer `shell_snapshot` over `shell_output` to observe the rendered screen. See `guide://shell/pty` for details.
-- **No real-time full-screen interaction**: The tool always works by "send → observe → decide". It cannot perform continuous real-time interaction that requires responding to a changing screen.
+- **Pipe mode (pty=false)**: Full-screen TUI/GUI programs (vim/nano/htop/less/whiptail, etc.) are prohibited — use cat/head/grep/ps instead, since there is no way to observe the actual screen layout without a real terminal.
+- **PTY mode (pty=true)**: Full-screen TUI interaction IS supported via `shell_snapshot` + `shell_send_keys` + `shell_cursor_position` + `shell_move_cursor` + `shell_resize`. See `guide://shell/tui` for the required send→snapshot→decide workflow.
+- **No real-time interaction**: The tool always works by "send → observe → decide". It cannot perform continuous real-time interaction that requires responding to a changing screen at human speed. Never chain many key-sends assuming you already know what the screen will look like several steps ahead.
 
 ## Scenarios
 
@@ -246,9 +258,13 @@ All subsequent commands execute on the target. Observe output before each next s
 | `shell_send_line` | Send command + newline (most common) | `input`, `tag` |
 | `shell_send` | Send raw bytes, no newline | `input`, `tag` |
 | `shell_send_control` | Send terminal control character (^C, ^D, ^Z, DEL) | `tag`, `key` |
+| `shell_send_keys` | Send special keys/text burst (arrows, Enter, Escape, F-keys, etc.) | `tag`, `keys` |
 | `shell_output` | Read buffered stdout/stderr | `tag`, `idle_ms?` |
 | `shell_wait_for` | Wait until pattern appears in output (with timeout) | `tag`, `pattern`, `timeout_ms?` |
-| `shell_snapshot` | Get rendered terminal screen (PTY only) | `tag`, `idle_ms?` |
+| `shell_snapshot` | Get rendered terminal screen + cursor (PTY only) | `tag`, `idle_ms?` |
+| `shell_cursor_position` | Get current cursor position (PTY only) | `tag` |
+| `shell_move_cursor` | Move cursor to absolute position via ANSI CUP (PTY only) | `tag`, `row`, `col` |
+| `shell_resize` | Dynamically resize PTY window (PTY only) | `tag`, `cols`, `rows` |
 | `shell_list` | List all sessions with PTY status and truncation info | — |
 | `shell_exists` | Check if a tag exists | `tag` |
 | `shell_reset` | Kill and restart a session | `tag` |
@@ -271,10 +287,11 @@ Built-in prompts generate step-by-step instructions for AI agents:
 Inline documentation accessible by AI agents via `read_resource`:
 
 | URI | Content |
-|---|---|---|
+|---|---|
 | `guide://shell/security` | Security guidelines — must read first |
 | `guide://shell/basics` | Session lifecycle and best practices |
 | `guide://shell/pty` | PTY mode guide: when to enable pty, preferring shell_snapshot |
+| `guide://shell/tui` | Driving full-screen TUI programs (vim/htop/less/whiptail) in pty mode |
 | `guide://shell/gdb` | GDB/pwndbg debugging workflow |
 | `guide://shell/ssh` | SSH remote connection workflow |
 | `guide://shell/sudo` | sudo password/confirmation handling |
@@ -282,7 +299,7 @@ Inline documentation accessible by AI agents via `read_resource`:
 
 ## Security Model
 
-- **Audit trails**: Every `exec` / `shell_spawn` / `shell_send` / `shell_send_line` / `shell_send_control` / `shell_wait_for` / `shell_snapshot` call is fully recorded with command content, shell type, tag, and timing
+- **Audit trails**: Every `exec` / `shell_spawn` / `shell_send` / `shell_send_line` / `shell_send_control` / `shell_send_keys` / `shell_output` / `shell_wait_for` / `shell_snapshot` / `shell_cursor_position` / `shell_move_cursor` / `shell_resize` call is fully recorded with command content, shell type, tag, and timing
 - **Explicit consent**: Destructive operations, privilege escalation, network exposure, and persistent changes require user approval before execution
 - **Read-only by default**: Commands like ls, cat, grep, ps, df that do not modify state can execute directly
 - **Remote operations**: SSH sessions and reverse shells inherently operate on remote targets and are exempt from local consent (unless they write to local disk or tunnel back)
