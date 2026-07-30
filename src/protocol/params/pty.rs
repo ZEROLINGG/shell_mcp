@@ -45,3 +45,11 @@ pub struct ResizeParams {
     /// New row count (must be >= 1)
     pub rows: u16,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SnapshotParams {
+    /// Target session identifier
+    pub tag: String,
+    /// Milliseconds to wait before snapshot
+    pub wait_ms: Option<u64>,
+}

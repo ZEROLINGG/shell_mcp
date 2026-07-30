@@ -6,5 +6,5 @@ mod session;
 
 pub use exec::ExecParams;
 pub use io::{OutputParams, SendParams, WaitForParams};
-pub use pty::{ControlParams, MoveCursorParams, ResizeParams, SendKeysParams};
+pub use pty::{ControlParams, MoveCursorParams, ResizeParams, SendKeysParams, SnapshotParams};
 pub use session::{SpawnParams, TagParams};

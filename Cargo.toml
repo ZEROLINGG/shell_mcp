@@ -23,7 +23,14 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 uuid = { version = "1.24.0", features = ["v4"] }
 
+async-trait = "0.1.91"
+tree-sitter = "0.20"
+tree-sitter-bash = "0.20"
+regex = "1"
+url = "2"
+
 shell-engine = "0.2.2"
+
 
 [features]
 default = ["pty"]

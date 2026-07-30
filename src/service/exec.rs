@@ -1,10 +1,11 @@
 // src/service/exec.rs
 use super::TerminalMcpService;
 use crate::protocol::params::ExecParams;
-use crate::{audit, audit_extra, config};
+use crate::{audit_extra, config};
 use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 use shell_engine::exec::exec;
 use std::time::Duration;
+use crate::security::audit;
 
 #[tool_router(router = exec_tool_router, vis = "pub(crate)")]
 impl TerminalMcpService {

@@ -1,12 +1,11 @@
 // src/service/pty.rs
 use super::TerminalMcpService;
-use crate::protocol::params::{
-    ControlParams, MoveCursorParams, OutputParams, ResizeParams, SendKeysParams, TagParams,
-};
-use crate::{audit, audit_extra, config};
+use crate::protocol::params::{ControlParams, MoveCursorParams, ResizeParams, SendKeysParams, SnapshotParams, TagParams};
+use crate::{audit_extra, config};
 use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 use shell_engine::shell::Key;
 use std::time::Duration;
+use crate::security::audit;
 
 #[tool_router(router = pty_tool_router, vis = "pub(crate)")]
 impl TerminalMcpService {
@@ -88,7 +87,7 @@ shell_send_keys / shell_cursor_position / shell_move_cursor / shell_resize — s
 for the required send -> snapshot -> decide workflow.")]
     async fn shell_snapshot(
         &self,
-        Parameters(OutputParams { tag, idle_ms, strip_ansi: _ }): Parameters<OutputParams>,
+        Parameters(SnapshotParams { tag, wait_ms }): Parameters<SnapshotParams>,
     ) -> String {
         let audit_tag = tag.clone();
 
@@ -96,10 +95,10 @@ for the required send -> snapshot -> decide workflow.")]
             #[cfg(feature = "pty")]
             {
                 let shell = self.registry.get(&tag)?;
-                let idle = Some(Duration::from_millis(idle_ms.unwrap_or(config::OUTPUT_IDLE_MS)));
+                let wait = Some(Duration::from_millis(wait_ms.unwrap_or(config::SNAPSHOT_WAIT_MS)));
 
                 let mut guard = shell.lock().await;
-                let screen = guard.output_snapshot(idle, None).await.map_err(|e| e.to_string())?;
+                let screen = guard.output_snapshot(None, wait).await.map_err(|e| e.to_string())?;
                 let cursor = guard
                     .cursor_position()
                     .ok()

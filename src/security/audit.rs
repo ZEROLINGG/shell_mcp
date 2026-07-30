@@ -127,3 +127,10 @@ macro_rules! audit_extra {
         serde_json::json!({ $( stringify!($key): $key ),* })
     };
 }
+
+pub fn truncate_for_log(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}

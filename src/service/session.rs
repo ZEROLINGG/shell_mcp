@@ -1,9 +1,10 @@
 // src/service/session.rs
 use super::TerminalMcpService;
 use crate::protocol::params::{SpawnParams, TagParams};
-use crate::{audit, audit_extra, config};
+use crate::{audit_extra, config};
 use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 use shell_engine::shell::Shell;
+use crate::security::audit;
 
 #[tool_router(router = session_tool_router, vis = "pub(crate)")]
 impl TerminalMcpService {
