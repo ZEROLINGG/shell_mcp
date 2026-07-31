@@ -19,9 +19,12 @@ use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 
+/// 规则并发评估的滑动窗口最大容量
+const MAX_CONCURRENT_RULES: usize = 30;
+
 static SHELL_DETECTION_LEVEL: LazyLock<Option<Severity>> = LazyLock::new(|| {
     match env::var("SHELL_DETECTION_LEVEL")
-        .unwrap_or_else(|_| "low".to_string())
+        .unwrap_or_else(|_| "medium".to_string())
         .to_lowercase()
         .as_str()
     {
@@ -49,7 +52,6 @@ static RULE_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(3000))
 });
-
 
 #[derive(Default)]
 pub struct Extensions {
@@ -101,13 +103,23 @@ pub enum Severity {
 pub struct RuleMetadata {
     pub name: String,
     pub description: String,
-    pub severity: Severity,
+    /// 规则的静态默认危险等级（用于UI展示和兜底）
+    pub default_severity: Severity,
+}
+
+/// 封装了单次规则命中的完整上下文
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreatHit {
+    pub rule_meta: RuleMetadata,
+    pub evidence: Option<String>,
+    /// 最终确定的危险等级（结合了规则动态返回的覆盖值与默认值）
+    pub final_severity: Severity,
 }
 
 #[derive(Debug, Clone)]
 pub enum DetectResult {
     Safe,
-    ThreatDetected(Vec<(RuleMetadata, Option<String>)>),
+    ThreatDetected(Vec<ThreatHit>),
     Unknown,
 }
 
@@ -115,7 +127,9 @@ impl DetectResult {
     /// 聚合出本次命中中的最高危级别，方便调用方直接决策
     pub fn max_severity(&self) -> Option<Severity> {
         match self {
-            DetectResult::ThreatDetected(hits) => hits.iter().map(|(m, _)| m.severity).max(),
+            DetectResult::ThreatDetected(hits) => {
+                hits.iter().map(|hit| hit.final_severity).max()
+            }
             _ => None,
         }
     }
@@ -156,20 +170,15 @@ impl ShellContext {
         h.push_back(cmd.into());
     }
 
-    /// 克隆一份历史快照，适合规则需要长期持有/跨 await 使用的场景。
     pub async fn history_snapshot(&self) -> Vec<String> {
         self.history.read().await.iter().cloned().collect()
     }
 
-    /// 零拷贝方式访问历史，闭包内直接借用 VecDeque。
-    /// 适合规则只需做一次性扫描（如 contains/positional 检查）的场景，
-    /// 避免为大容量历史付出整体 clone 的代价。
     pub async fn with_history<R>(&self, f: impl FnOnce(&VecDeque<String>) -> R) -> R {
         let guard = self.history.read().await;
         f(&guard)
     }
 
-    /// 便捷方法：取最近 n 条历史（不含当前正在评估的这条）
     pub async fn recent_history(&self, n: usize) -> Vec<String> {
         self.with_history(|h| h.iter().rev().take(n).rev().cloned().collect())
             .await
@@ -177,8 +186,22 @@ impl ShellContext {
 }
 
 pub enum EvaluateResult {
-    Hit(Option<String>),
+    /// 命中。参数1为证据(可选)，参数2为动态评估的危险等级(可选)
+    /// 如果返回动态危险等级，将覆盖 RuleMetadata 中的 default_severity
+    Hit(Option<String>, Option<Severity>),
     Miss,
+}
+
+impl EvaluateResult {
+    /// 辅助方法：快速构建不覆盖默认等级的命中
+    pub fn hit(evidence: impl Into<String>) -> Self {
+        EvaluateResult::Hit(Some(evidence.into()), None)
+    }
+
+    /// 辅助方法：快速构建带有动态危险等级的命中
+    pub fn hit_with_severity(evidence: impl Into<String>, severity: Severity) -> Self {
+        EvaluateResult::Hit(Some(evidence.into()), Some(severity))
+    }
 }
 
 #[async_trait]
@@ -249,23 +272,30 @@ pub trait Detector: Send + Sync {
             });
         };
 
-        // 初始填充滑动窗口
-        for _ in 0..30 {
+        // 初始填充滑动窗口，控制最大并发量
+        for _ in 0..MAX_CONCURRENT_RULES {
             if let Some(rule) = rules_iter.next() {
                 spawn_rule(&mut set, rule, Arc::clone(&data_arc), Arc::clone(ctx));
             }
         }
 
-
         while let Some(res) = set.join_next().await {
             match res {
                 Ok((rule, timeout_res)) => {
                     match timeout_res {
-                        Ok(Ok(EvaluateResult::Hit(evidence))) => {
+                        // 【核心改动】接收 rule 动态评估返回的 override_severity
+                        Ok(Ok(EvaluateResult::Hit(evidence, override_severity))) => {
                             let meta = rule.meta().clone();
-                            let is_over_threshold = meta.severity >= threshold_severity;
 
-                            hits.push((meta, evidence));
+                            // 动态计算：如果有覆盖值则使用覆盖值，否则回退到静态默认值
+                            let final_severity = override_severity.unwrap_or(meta.default_severity);
+                            let is_over_threshold = final_severity >= threshold_severity;
+
+                            hits.push(ThreatHit {
+                                rule_meta: meta,
+                                evidence,
+                                final_severity,
+                            });
                             evaluated += 1;
 
                             if stop_on_first_hit && is_over_threshold {
@@ -280,7 +310,7 @@ pub trait Detector: Send + Sync {
                             tracing::error!(
                                 target: "security::detect",
                                 rule_name = %rule.meta().name,
-                                rule_severity = ?rule.meta().severity,
+                                rule_default_severity = ?rule.meta().default_severity,
                                 shell = %ctx.shell_path,
                                 input_len = data_str.len(),
                                 input_preview = %truncate_for_log(data_str, 200),
@@ -293,7 +323,7 @@ pub trait Detector: Send + Sync {
                             tracing::warn!(
                                 target: "security::detect",
                                 rule_name = %rule.meta().name,
-                                rule_severity = ?rule.meta().severity,
+                                rule_default_severity = ?rule.meta().default_severity,
                                 shell = %ctx.shell_path,
                                 input_len = data_str.len(),
                                 input_preview = %truncate_for_log(data_str, 200),
@@ -309,6 +339,7 @@ pub trait Detector: Send + Sync {
                 }
             }
 
+            // 窗口滑动：完成一个任务，再补充一个新任务
             if let Some(rule) = rules_iter.next() {
                 spawn_rule(&mut set, rule, Arc::clone(&data_arc), Arc::clone(ctx));
             }

@@ -1,19 +1,21 @@
+
 #[macro_export]
 macro_rules! sec_bash_detector_rule_metadata {
-    ($name:expr, $desc:expr, $severity:expr) => {
+    ($name:expr, $desc:expr, $default_severity:expr) => {
         fn get_meta() -> &'static crate::security::detect::RuleMetadata {
             static META: std::sync::LazyLock<crate::security::detect::RuleMetadata> =
                 std::sync::LazyLock::new(|| {
                     crate::security::detect::RuleMetadata {
                         name: $name.to_string(),
                         description: $desc.to_string(),
-                        severity: $severity,
+                        default_severity: $default_severity,
                     }
                 });
             &META
         }
     };
 }
+
 #[macro_export]
 macro_rules! sec_bash_detector_rule_query {
     ($rule_name:ident, $query:expr) => {
@@ -28,17 +30,15 @@ macro_rules! sec_bash_detector_rule_query {
     };
 }
 
-
-
 #[macro_export]
 macro_rules! sec_bash_detector_rule_impl_base {
-    ($rule_name:ident, name: $name:expr, desc: $desc:expr, severity: $severity:expr,
+    ($rule_name:ident, name: $name:expr, desc: $desc:expr, default_severity: $default_severity:expr,
      query: $query:expr, capture: $capture_logic:expr) => {
         pub struct $rule_name;
 
         impl $rule_name {
             $crate::sec_bash_detector_rule_query!($rule_name, $query);
-            $crate::sec_bash_detector_rule_metadata!($name, $desc, $severity);
+            $crate::sec_bash_detector_rule_metadata!($name, $desc, $default_severity);
         }
 
         #[async_trait::async_trait]
@@ -61,12 +61,13 @@ macro_rules! sec_bash_detector_rule_impl_base {
 
                     for m in cursor.matches(Self::get_query(), block.tree.root_node(), source_bytes) {
                         for capture in m.captures {
+                            // 【更新】闭包直接返回 EvaluateResult
                             let logic: fn(&tree_sitter::Node, &[u8])
-                                -> anyhow::Result<Option<String>> = $capture_logic;
-                            if let Some(evidence) = logic(&capture.node, source_bytes)? {
-                                return Ok(crate::security::detect::EvaluateResult::Hit(
-                                    Some(evidence)
-                                ));
+                                -> anyhow::Result<crate::security::detect::EvaluateResult> = $capture_logic;
+                            
+                            match logic(&capture.node, source_bytes)? {
+                                hit @ crate::security::detect::EvaluateResult::Hit(_, _) => return Ok(hit),
+                                crate::security::detect::EvaluateResult::Miss => continue,
                             }
                         }
                     }
@@ -79,13 +80,13 @@ macro_rules! sec_bash_detector_rule_impl_base {
 
 #[macro_export]
 macro_rules! sec_bash_detector_rule_impl_multi_capture {
-    ($rule_name:ident, name: $name:expr, desc: $desc:expr, severity: $severity:expr,
+    ($rule_name:ident, name: $name:expr, desc: $desc:expr, default_severity: $default_severity:expr,
      query: $query:expr, logic: $logic:expr) => {
         pub struct $rule_name;
 
         impl $rule_name {
             $crate::sec_bash_detector_rule_query!($rule_name, $query);
-            $crate::sec_bash_detector_rule_metadata!($name, $desc, $severity);
+            $crate::sec_bash_detector_rule_metadata!($name, $desc, $default_severity);
         }
 
         #[async_trait::async_trait]
@@ -109,15 +110,16 @@ macro_rules! sec_bash_detector_rule_impl_multi_capture {
 
                     for m in cursor.matches(query, block.tree.root_node(), source_bytes) {
                         let caps = crate::security::detect::bash::ast::captures_map(query, &m);
+                        
+                        // 【更新】闭包直接返回 EvaluateResult
                         let logic: fn(
                             &std::collections::HashMap<String, tree_sitter::Node>,
                             &[u8],
-                        ) -> anyhow::Result<Option<String>> = $logic;
+                        ) -> anyhow::Result<crate::security::detect::EvaluateResult> = $logic;
 
-                        if let Some(evidence) = logic(&caps, source_bytes)? {
-                            return Ok(crate::security::detect::EvaluateResult::Hit(
-                                Some(evidence)
-                            ));
+                        match logic(&caps, source_bytes)? {
+                            hit @ crate::security::detect::EvaluateResult::Hit(_, _) => return Ok(hit),
+                            crate::security::detect::EvaluateResult::Miss => continue,
                         }
                     }
                 }
@@ -129,14 +131,14 @@ macro_rules! sec_bash_detector_rule_impl_multi_capture {
 
 #[macro_export]
 macro_rules! sec_bash_detector_rule_impl_regex_base {
-    ($rule_name:ident, name: $name:expr, desc: $desc:expr, severity: $severity:expr,
+    ($rule_name:ident, name: $name:expr, desc: $desc:expr, default_severity: $default_severity:expr,
      regex: $regex:expr) => {
         pub struct $rule_name;
 
         $crate::lazy_regex!(static RE = $regex);
 
         impl $rule_name {
-            $crate::sec_bash_detector_rule_metadata!($name, $desc, $severity);
+            $crate::sec_bash_detector_rule_metadata!($name, $desc, $default_severity);
         }
 
         #[async_trait::async_trait]
@@ -149,9 +151,7 @@ macro_rules! sec_bash_detector_rule_impl_regex_base {
                 -> anyhow::Result<crate::security::detect::EvaluateResult>
             {
                 if let Some(mat) = RE.find(data) {
-                    Ok(crate::security::detect::EvaluateResult::Hit(
-                        Some(mat.as_str().to_string())
-                    ))
+                    Ok(crate::security::detect::EvaluateResult::hit(mat.as_str().to_string()))
                 } else {
                     Ok(crate::security::detect::EvaluateResult::Miss)
                 }
@@ -159,4 +159,3 @@ macro_rules! sec_bash_detector_rule_impl_regex_base {
         }
     };
 }
-

